@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Phonebook Application deployed on ALB, ASG, and RDS MySQL using CloudFormation
+
+Parameters:
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: Default VPC ID
+
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select subnets in default VPC (at least 2 in different AZs)
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Select Key pair name for SSH access
+
+  GithubRepo:
+    Type: String
+    Default: "https://github.com/YOUR_GITHUB_ACCOUNT/004-phonebook-web-application.git"
+    Description: GitHub repo repository URL containing app.py and templates
+
+  DeveloperName:
+    Type: String
+    Default: "Haluk Aktas"
+    Description: Developer name for application footer/title
+
+Resources:
+  # Security Group for Application Load Balancer
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access for ALB from anywhere
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # Security Group for EC2 Web Servers
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access from ALB and SSH from anywhere
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  # Security Group for RDS MySQL Database
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable MySQL access from Web Server SG
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebServerSecurityGroup
+
+  # RDS MySQL Database Instance
+  PhonebookRDSDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: phonebook-rds
+      AllocatedStorage: '20'
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: false
+      BackupRetentionPeriod: 0
+      DBInstanceClass: db.t3.micro
+      DBInstanceIdentifier: phone-book-app
+      Engine: mysql
+      EngineVersion: '8.4.9'
+      MasterUsername: admin
+      MasterUserPassword: phonebook_1234
+      DBName: my_phonebook
+      VPCSecurityGroups:
+        - !GetAtt RDSSecurityGroup.GroupId
+      PubliclyAccessible: true
+      DeletionPolicy: Delete
+
+  # EC2 Launch Template
+  PhonebookLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: phonebook-launch-template
+      LaunchTemplateData:
+        ImageId: resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64  
+        InstanceType: t3.micro
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !GetAtt WebServerSecurityGroup.GroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "Web Server of ${AWS::StackName}"
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf update -y
+            dnf install python3-pip git mariadb105 -y
+            pip3 install Flask
+            pip3 install flask flask-mysql
+            dnf install git -y
+
+            echo "${PhonebookRDSDB.Endpoint.Address}" > /home/ec2-user/dbserver.endpoint
+
+            cd /home/ec2-user
+            git clone ${GithubRepo} app-repo
+            cp -r /home/ec2-user/app-repo/* /home/ec2-user/
+
+            sed -i "s/YOUR_NAME_HERE/${DeveloperName}/g" /home/ec2-user/phonebook-app.py
+
+            python3 /home/ec2-user/phonebook-app.py
+
+  # ALB Target Group
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPCId
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: phonebook-alb
+      Scheme: internet-facing
+      Subnets: !Ref Subnets
+      SecurityGroups:
+        - !GetAtt ALBSecurityGroup.GroupId
+      Type: application
+
+  # ALB Listener
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Auto Scaling Group
+  PhonebookASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Ref Subnets
+      LaunchTemplate:
+        LaunchTemplateId: !Ref PhonebookLaunchTemplate
+        Version: !GetAtt PhonebookLaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '3'
+      DesiredCapacity: '2'
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 90
+
+Outputs:
+  WebsiteURL:
+    Description: URL of the Phonebook Application
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}"
