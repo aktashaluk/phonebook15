@@ -91,7 +91,7 @@ Resources:
                 cd /home/ec2-user
                 TOKEN="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"
                 git clone https://$TOKEN@github.com/aktashaluk/phonebook15.git
-                python3 /home/ec2-user/guile-phonebook/phonebook-app.py
+                python3 /home/ec2-user/phonebook15/phonebook-app.py
               - MyDBURI: !GetAtt DBInstance.Endpoint.Address
 
 
